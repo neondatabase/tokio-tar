@@ -12,7 +12,7 @@ use tokio::{
 ///
 /// This structure has methods for building up an archive from scratch into any
 /// arbitrary writer.
-pub struct Builder<W: Write + Unpin + Send + 'static> {
+pub struct Builder<W: Write + Unpin + Send> {
     mode: HeaderMode,
     follow: bool,
     finished: bool,
@@ -20,15 +20,20 @@ pub struct Builder<W: Write + Unpin + Send + 'static> {
     cancellation: Option<tokio::sync::oneshot::Sender<W>>,
 }
 
+const TERMINATION: &[u8; 1024] = &[0; 1024];
+
 impl<W: Write + Unpin + Send + 'static> Builder<W> {
     /// Create a new archive builder with the underlying object as the
     /// destination of all data written. The builder will use
     /// `HeaderMode::Complete` by default.
+    ///
+    /// On drop, would write [`TERMINATION`] into the end of the archive,
+    /// use `skip_termination` method to disable this.
     pub fn new(obj: W) -> Builder<W> {
         let (tx, rx) = tokio::sync::oneshot::channel::<W>();
         tokio::spawn(async move {
             if let Ok(mut w) = rx.await {
-                let _ = w.write_all(&[0; 1024]).await;
+                let _ = w.write_all(TERMINATION).await;
             }
         });
         Builder {
@@ -37,6 +42,23 @@ impl<W: Write + Unpin + Send + 'static> Builder<W> {
             finished: false,
             obj: Some(obj),
             cancellation: Some(tx),
+        }
+    }
+}
+
+impl<W: Write + Unpin + Send> Builder<W> {
+    /// Create a new archive builder with the underlying object as the
+    /// destination of all data written. The builder will use
+    /// `HeaderMode::Complete` by default.
+    ///
+    /// The [`TERMINATION`] symbol would not be written to the archive in the end.
+    pub fn new_non_terminated(obj: W) -> Builder<W> {
+        Builder {
+            mode: HeaderMode::Complete,
+            follow: true,
+            finished: false,
+            obj: Some(obj),
+            cancellation: None,
         }
     }
 
@@ -51,6 +73,11 @@ impl<W: Write + Unpin + Send + 'static> Builder<W> {
     /// than adding a symlink to the archive. Defaults to true.
     pub fn follow_symlinks(&mut self, follow: bool) {
         self.follow = follow;
+    }
+
+    /// Skip writing final termination bytes into the archive.
+    pub fn skip_termination(&mut self) {
+        drop(self.cancellation.take());
     }
 
     /// Gets shared reference to the underlying object.
@@ -182,7 +209,7 @@ impl<W: Write + Unpin + Send + 'static> Builder<W> {
     ) -> io::Result<()> {
         prepare_header_path(self.get_mut(), header, path.as_ref()).await?;
         header.set_cksum();
-        self.append(&header, data).await?;
+        self.append(header, data).await?;
 
         Ok(())
     }
@@ -528,7 +555,7 @@ async fn prepare_header_path<Dst: Write + Unpin + ?Sized>(
     // long name extension by emitting an entry which indicates that it's the
     // filename.
     if let Err(e) = header.set_path(path) {
-        let data = path2bytes(&path)?;
+        let data = path2bytes(path)?;
         let max = header.as_old().name.len();
         //  Since e isn't specific enough to let us know the path is indeed too
         //  long, verify it first before using the extension.
@@ -553,8 +580,8 @@ async fn prepare_header_link<Dst: Write + Unpin + ?Sized>(
     link_name: &Path,
 ) -> io::Result<()> {
     // Same as previous function but for linkname
-    if let Err(e) = header.set_link_name(&link_name) {
-        let data = path2bytes(&link_name)?;
+    if let Err(e) = header.set_link_name(link_name) {
+        let data = path2bytes(link_name)?;
         if data.len() < header.as_old().linkname.len() {
             return Err(e);
         }
@@ -595,7 +622,7 @@ async fn append_dir_all<Dst: Write + Unpin + ?Sized>(
 ) -> io::Result<()> {
     let mut stack = vec![(src_path.to_path_buf(), true, false)];
     while let Some((src, is_dir, is_symlink)) = stack.pop() {
-        let dest = path.join(src.strip_prefix(&src_path).unwrap());
+        let dest = path.join(src.strip_prefix(src_path).unwrap());
 
         // In case of a symlink pointing to a directory, is_dir is false, but src.is_dir() will return true
         if is_dir || (is_symlink && follow && src.is_dir()) {
@@ -619,15 +646,13 @@ async fn append_dir_all<Dst: Write + Unpin + ?Sized>(
     Ok(())
 }
 
-impl<W: Write + Unpin + Send + 'static> Drop for Builder<W> {
+impl<W: Write + Unpin + Send> Drop for Builder<W> {
     fn drop(&mut self) {
         // TODO: proper async cancellation
         if !self.finished {
-            let _ = self
-                .cancellation
-                .take()
-                .unwrap()
-                .send(self.obj.take().unwrap());
+            if let Some(cancellation) = self.cancellation.take() {
+                cancellation.send(self.obj.take().unwrap()).ok();
+            }
         }
     }
 }
